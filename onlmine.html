@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>マイクラ風オンライン同期 完全版（重力＆ジャンプ修正版）</title>
+<style>
+body{margin:0;overflow:hidden;background:#87ceeb;}
+#crosshair{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);color:white;font-size:22px;pointer-events:none;font-family:sans-serif;}
+#msg{position:fixed;top:10px;left:50%;transform:translateX(-50%);background:#0008;color:white;padding:6px 12px;border-radius:6px;font-family:sans-serif;}
+#progressBarContainer{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);width:220px;height:12px;background:#0008;border-radius:6px;display:none;}
+#progressBar{width:0%;height:100%;background:#ffcc00;border-radius:6px;}
+#netUI{position:fixed;top:50px;right:10px;background:#0008;color:white;padding:10px;border-radius:6px;font-family:sans-serif;}
+#netUI button{margin:2px;}
+#log{position:fixed;bottom:10px;left:10px;color:white;font-family:sans-serif;font-size:12px;background:#0008;padding:4px 6px;border-radius:4px;max-width:300px;max-height:150px;overflow:auto;}
+</style>
+</head>
+<body>
+<div id="crosshair">+</div>
+<div id="msg">クリックして開始</div>
+<div id="progressBarContainer"><div id="progressBar"></div></div>
+<div id="netUI">
+  <div id="modeSelect">
+    <button onclick="startHost()">ホストになる</button>
+    <button onclick="showJoin()">参加する</button>
+  </div>
+  <div id="hostUI" style="display:none">
+    <h3>あなたはホストです</h3>
+    <div id="myId">ID生成中...</div>
+  </div>
+  <div id="joinUI" style="display:none">
+    <input id="hostIdInput" placeholder="ホストID">
+    <button onclick="joinHost()">接続</button>
+  </div>
+</div>
+<div id="log"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160/build/three.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<script>
+// ===== ヘルパー =====
+function log(msg){const l=document.getElementById("log");l.innerHTML+=msg+"<br>";l.scrollTop=l.scrollHeight;}
+
+// ===== 設定 =====
+const CHUNK=3, RENDER=3;
+const PLAYER_H=1.5, GRAVITY=-9.8, JUMP=5, MOVE_SPEED=4;
+const REACH=5; 
+const blockHardness={grass:0.8,dirt:0.8,stone:2,bedrock:Infinity};
+const LAYERS=[{y:-1,type:"grass"},{y:-2,type:"dirt"},{y:-3,type:"stone"},{y:-4,type:"stone"},{y:-5,type:"stone"},{y:-6,type:"bedrock"}];
+
+// ===== Three.js =====
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x87ceeb);
+scene.fog=new THREE.Fog(0x87ceeb,10,60);
+const camera=new THREE.PerspectiveCamera(75,innerWidth/innerHeight,0.1,1000);
+const renderer=new THREE.WebGLRenderer();
+renderer.setSize(innerWidth,innerHeight);
+renderer.shadowMap.enabled=true;
+renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.AmbientLight(0xffffff,0.9));
+const sun=new THREE.DirectionalLight(0xffffff,0.8);
+sun.position.set(10,20,10); sun.castShadow=true;
+scene.add(sun);
+
+// ===== Pointer Lock & 視点 =====
+let locked=false;
+document.body.addEventListener("click",()=>renderer.domElement.requestPointerLock());
+document.addEventListener("pointerlockchange",()=>{locked=document.pointerLockElement===renderer.domElement;document.getElementById("msg").style.display=locked?"none":"block";});
+let yaw=0,pitch=0;
+document.addEventListener("mousemove",e=>{
+  if(!locked) return;
+  yaw-=e.movementX*0.002; pitch-=e.movementY*0.002;
+  pitch=Math.max(-Math.PI/2,Math.min(Math.PI/2,pitch));
+  camera.rotation.order="YXZ"; camera.rotation.y=yaw; camera.rotation.x=pitch;
+});
+
+// ===== 入力 =====
+const keys={}; let mouseDown=false;
+document.addEventListener("keydown",e=>keys[e.code]=true);
+document.addEventListener("keyup",e=>keys[e.code]=false);
+document.addEventListener("mousedown",e=>{if(e.button===0) mouseDown=true;});
+document.addEventListener("mouseup",e=>{
+  if(e.button===0){
+    mouseDown=false;
+    breaking=null;
+    document.getElementById("progressBarContainer").style.display="none";
+    document.getElementById("progressBar").style.width="0%";
+  }
+});
+let velocityY=0,onGround=false;
+let playerY=PLAYER_H+0.25; // プレイヤーの中心Y座標
+
+// ===== ブロック管理 =====
+const blocks=new Map();
+const boxGeo=new THREE.BoxGeometry(1,1,1);
+const mats={grass:0x4caf50,dirt:0x8b5a2b,stone:0x888888,bedrock:0x222222};
+function addBlock(x,y,z,type,send=true){
+  const k=`${x},${y},${z}`; if(blocks.has(k)) return;
+  const mesh=new THREE.Mesh(boxGeo,new THREE.MeshLambertMaterial({color:mats[type]}));
+  mesh.position.set(x+0.5,y+0.5,z+0.5); mesh.castShadow=true; mesh.receiveShadow=true;
+  scene.add(mesh); blocks.set(k,{mesh,type});
+  if(send && isHost) sendToAll({type:"addBlock",x,y,z,blockType:type});
+}
+function removeBlock(x,y,z){const k=`${x},${y},${z}`; const b=blocks.get(k);if(!b) return; scene.remove(b.mesh);blocks.delete(k);if(isHost) sendToAll({type:"break",x,y,z});}
+function hasBlock(x,y,z){return blocks.has(`${Math.floor(x)},${Math.floor(y)},${Math.floor(z)}`);}
+
+// ===== オンライン =====
+let isHost=false, peer=null, myId=null;
+const connections={}, otherPlayers={}, playerMeshes={};
+let worldLoaded=false;
+function startHost(){isHost=true; peer=new Peer(); document.getElementById("modeSelect").style.display="none"; document.getElementById("hostUI").style.display="block";
+  peer.on("open",id=>{myId=id; document.getElementById("myId").textContent="ホストID: "+id; generateWorld();});
+  peer.on("connection",conn=>setupConnection(conn));
+}
+function showJoin(){document.getElementById("modeSelect").style.display="none"; document.getElementById("joinUI").style.display="block";}
+function joinHost(){const hostId=document.getElementById("hostIdInput").value.trim();if(!hostId) return alert("ホストIDを入力"); peer=new Peer(); peer.on("open",id=>{myId=id; const conn=peer.connect(hostId,{reliable:true}); setupConnection(conn); document.getElementById("joinUI").style.display="none";});}
+function setupConnection(conn){
+  conn.on("open",()=>{connections[conn.peer]=conn; createOtherPlayer(conn.peer);
+    if(isHost){const world=[]; for(const [k,v] of blocks){const [x,y,z]=k.split(",").map(Number); world.push({x,y,z,type:v.type});} conn.send({type:"world",world});}
+  });
+  conn.on("data",data=>{
+    if(data.type==="player") otherPlayers[conn.peer]={...data,lastSeen:performance.now()};
+    else if(data.type==="addBlock") addBlock(data.x,data.y,data.z,data.blockType,false);
+    else if(data.type==="break") removeBlock(data.x,data.y,data.z);
+    else if(data.type==="world"){for(const m of blocks.values()) scene.remove(m.mesh); blocks.clear(); data.world.forEach(v=>addBlock(v.x,v.y,v.z,v.type,false)); worldLoaded=true;}
+  });
+  conn.on("close",()=>removeOtherPlayer(conn.peer));
+}
+function sendToAll(data){for(let id in connections) connections[id].send(data);}
+function sendPlayerState(){sendToAll({type:"player",x:camera.position.x,y:playerY,z:camera.position.z,yaw,pitch,moving:keys["KeyW"]||keys["KeyS"]||keys["KeyA"]||keys["KeyD"],digging:mouseDown});}
+
+// ===== ワールド生成 =====
+function generateWorld(){for(let x=-RENDER*CHUNK;x<=RENDER*CHUNK;x++){for(let z=-RENDER*CHUNK;z<=RENDER*CHUNK;z++){LAYERS.forEach(l=>addBlock(x,l.y,z,l.type));}} worldLoaded=true;}
+
+// ===== プレイヤー作成（髪付き） =====
+function createOtherPlayer(peerId){
+  if(playerMeshes[peerId]) return;
+  const group=new THREE.Group();
+  const body=new THREE.Mesh(new THREE.BoxGeometry(0.5,1,0.3),new THREE.MeshLambertMaterial({color:0x5555ff}));
+  body.position.y=0; body.castShadow=true; group.add(body);
+  const head=new THREE.Mesh(new THREE.BoxGeometry(0.5,0.5,0.5),new THREE.MeshLambertMaterial({color:0xffcc99}));
+  head.position.y=0.75; group.add(head);
+  const hairHeight=0.1;
+  const hair=new THREE.Mesh(new THREE.BoxGeometry(0.5,hairHeight,0.5),new THREE.MeshLambertMaterial({color:0x000000}));
+  hair.position.y=0.75 + 0.25 + hairHeight/2; group.add(hair);
+  const leftArm=new THREE.Mesh(new THREE.BoxGeometry(0.3,1,0.3),new THREE.MeshLambertMaterial({color:0x5555ff}));
+  leftArm.position.set(-0.35,0,0); group.add(leftArm);
+  const rightArm=new THREE.Mesh(new THREE.BoxGeometry(0.3,1,0.3),new THREE.MeshLambertMaterial({color:0x5555ff}));
+  rightArm.position.set(0.35,0,0); group.add(rightArm);
+  const leftLeg=new THREE.Mesh(new THREE.BoxGeometry(0.3,1,0.3),new THREE.MeshLambertMaterial({color:0x5555ff}));
+  leftLeg.position.set(-0.15,-1,0); group.add(leftLeg);
+  const rightLeg=new THREE.Mesh(new THREE.BoxGeometry(0.3,1,0.3),new THREE.MeshLambertMaterial({color:0x5555ff}));
+  rightLeg.position.set(0.15,-1,0); group.add(rightLeg);
+  const label=createIdLabel(peerId);
+  label.position.y=1.5; group.add(label);
+  playerMeshes[peerId]={group, body, head, hair, leftArm, rightArm, leftLeg, rightLeg};
+  scene.add(group);
+}
+function removeOtherPlayer(peerId){const g=playerMeshes[peerId]; if(g) scene.remove(g.group); delete playerMeshes[peerId]; delete otherPlayers[peerId];}
+function createIdLabel(text){const canvas=document.createElement("canvas"); canvas.width=256; canvas.height=64; const ctx=canvas.getContext("2d"); ctx.fillStyle="white"; ctx.font="28px sans-serif"; ctx.textAlign="center"; ctx.fillText(text,128,40); const tex=new THREE.CanvasTexture(canvas); const mat=new THREE.SpriteMaterial({map:tex,transparent:true}); const sprite=new THREE.Sprite(mat); sprite.scale.set(1.5,0.4,1); return sprite;}
+
+// ===== 安全スポーン =====
+function safeSpawn(){playerY = PLAYER_H+0.25; velocityY=0; camera.position.set(0.5,playerY,0.5);}
+
+// ===== メインループ =====
+let prevTime=performance.now();
+const raycaster=new THREE.Raycaster(); let breaking=null;
+function animate(){
+  requestAnimationFrame(animate);
+  const now=performance.now(); const delta=(now-prevTime)/1000; prevTime=now;
+
+  if(!isHost && !worldLoaded){renderer.render(scene,camera); return;}
+
+  if(locked){
+    // ===== 衝突付き移動 =====
+    const forward=new THREE.Vector3(-Math.sin(yaw),0,-Math.cos(yaw));
+    const right=new THREE.Vector3(Math.cos(yaw),0,-Math.sin(yaw));
+    let move=new THREE.Vector3();
+    if(keys["KeyW"]) move.add(forward);
+    if(keys["KeyS"]) move.sub(forward);
+    if(keys["KeyA"]) move.sub(right);
+    if(keys["KeyD"]) move.add(right);
+    if(move.length()>0){
+      move.normalize().multiplyScalar(MOVE_SPEED*delta);
+      let nextX=camera.position.x+move.x;
+      let nextZ=camera.position.z+move.z;
+      const footY=Math.floor(playerY-PLAYER_H);
+      const headY=Math.floor(playerY-0.1);
+      if(!hasBlock(Math.floor(nextX),footY,Math.floor(camera.position.z))&&!hasBlock(Math.floor(nextX),headY,Math.floor(camera.position.z))) camera.position.x=nextX;
+      if(!hasBlock(Math.floor(camera.position.x),footY,Math.floor(nextZ))&&!hasBlock(Math.floor(camera.position.x),headY,Math.floor(nextZ))) camera.position.z=nextZ;
+    }
+
+    // ===== 重力＆床判定 =====
+    velocityY += GRAVITY * delta;
+    playerY += velocityY * delta;
+    const footY = playerY - PLAYER_H;
+    const px = Math.floor(camera.position.x);
+    const py = Math.floor(footY);
+    const pz = Math.floor(camera.position.z);
+    if(hasBlock(px,py,pz)){
+      onGround = true; velocityY=0; playerY = py + 1 + PLAYER_H;
+    } else {onGround=false;}
+    if(keys["Space"] && onGround) velocityY = JUMP;
+    if(playerY < -50) safeSpawn();
+
+    // ===== 掘る処理 =====
+    if(mouseDown){
+      raycaster.setFromCamera(new THREE.Vector2(0,0),camera);
+      const hits=raycaster.intersectObjects([...blocks.values()].map(b=>b.mesh));
+      if(hits.length>0 && hits[0].distance<=REACH){
+        const hit=hits[0].object;
+        for(const [k,v] of blocks){
+          if(v.mesh===hit && blockHardness[v.type]!==Infinity){
+            if(!breaking){breaking={x:+k.split(",")[0],y:+k.split(",")[1],z:+k.split(",")[2],type:v.type,progress:0}; document.getElementById("progressBarContainer").style.display="block";}
+            break;
+          }
+        }
+      }
+    }
+    if(breaking){breaking.progress+=delta; const ratio=breaking.progress/blockHardness[breaking.type]; document.getElementById("progressBar").style.width=Math.min(ratio*100,100)+"%"; if(ratio>=1){removeBlock(breaking.x,breaking.y,breaking.z); breaking=null; document.getElementById("progressBarContainer").style.display="none";}}
+  }
+
+  // ===== 他プレイヤー更新 =====
+  for(const id in playerMeshes){
+    const pMesh=playerMeshes[id]; const p=otherPlayers[id]; if(!p) continue;
+    if(performance.now()-p.lastSeen<3000){
+      const g=pMesh.group; g.visible=true;
+      g.position.set(p.x,p.y,p.z); g.rotation.y=p.yaw; g.head.rotation.x=p.pitch;
+      const moving=p.moving; const digging=p.digging;
+      const t=performance.now()*0.005;
+      if(moving){const step=Math.sin(t)*0.5; pMesh.leftLeg.rotation.x=step; pMesh.rightLeg.rotation.x=-step; pMesh.leftArm.rotation.x=-step*0.5; if(!digging)pMesh.rightArm.rotation.x=step*0.5;}else{pMesh.leftLeg.rotation.x=0; pMesh.rightLeg.rotation.x=0; pMesh.leftArm.rotation.x=0; if(!digging)pMesh.rightArm.rotation.x=0;}
+      if(digging) pMesh.rightArm.rotation.x=Math.sin(t*10)*1.0-1.0;
+    }else pMesh.group.visible=false;
+  }
+
+  // ===== カメラ追従（頭の高さ） =====
+  camera.position.y = playerY + 0.7;
+
+  sendPlayerState();
+  renderer.render(scene,camera);
+}
+animate();
+</script>
+</body>
+</html>
