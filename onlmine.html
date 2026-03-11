@@ -87,7 +87,7 @@ input{font-size:16px;padding:10px;border-radius:5px;border:none;background:#333;
 // ===== 定数と変数 =====
 let CHUNK=3; 
 const RENDER=2, PLAYER_H=1.6, GRAVITY=-15, JUMP=6, MOVE_SPEED=5, CROUCH_SPEED=1.5, REACH=5;
-const blockHardness={ grass: 1.0, dirt: 1.0, stone: 3.0, slime: 1.0, bedrock: Infinity };
+const blockHardness={ grass: 1.0, dirt: 1.0, stone: 3.0, slime: 0.5, bedrock: Infinity };
 const FIXED_SKIN_TONE = 0xffcc99, FIXED_NAME_COLOR = 0xffffff;
 const COLORS = [0xe53935, 0x1e88e5, 0x43a047, 0xfb8c00, 0x8e24aa, 0xfdd835, 0x00acc1, 0x546e7a, 0x333333];
 
@@ -351,10 +351,39 @@ function createOtherPlayerModel(peerId, name, shirt){
     return playerMeshes[peerId];
 }
 function createNameLabel(text) {
-    const canvas = document.createElement("canvas"); canvas.width = 256; canvas.height = 64; const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(0, 0, 256, 64); ctx.fillStyle = "white"; ctx.font = "bold 32px Arial"; ctx.textAlign = "center"; ctx.fillText(text, 128, 45);
-    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(canvas)}));
-    sprite.scale.set(1.2, 0.3, 1); return sprite;
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+
+    ctx.font = "bold 32px Arial";
+
+    // 文字の幅を測定
+    const textWidth = ctx.measureText(text).width;
+
+    // 余白を追加
+    const padding = 40;
+    canvas.width = textWidth + padding;
+    canvas.height = 64;
+
+    // 再設定（canvasサイズ変更でリセットされるため）
+    ctx.font = "bold 32px Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    // 背景
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 文字
+    ctx.fillStyle = "white";
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture }));
+
+    // 名前の長さに応じて3Dサイズも調整
+    sprite.scale.set(canvas.width / 200, 0.3, 1);
+
+    return sprite;
 }
 function removeOtherPlayer(id) { if(playerMeshes[id]){ scene.remove(playerMeshes[id].group); const name = otherPlayers[id]?.name || "Player"; log(name + " が退出しました"); delete playerMeshes[id]; delete otherPlayers[id]; } }
 
