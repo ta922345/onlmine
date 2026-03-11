@@ -234,8 +234,18 @@ async function handleData(data, senderId) {
         if(isHostFlag) sendToAll(data, senderId);
     } else if(data.type === "addBlock") { addBlock(data.x, data.y, data.z, data.blockType, false); if(isHostFlag) sendToAll(data, senderId);
     } else if(data.type === "break") { removeBlock(data.x, data.y, data.z, false); if(isHostFlag) sendToAll(data, senderId);
-    } else if(data.type === "attack") { if(data.target === myId) takeDamage(data.dmg, data.attackerPos, senderId); if(isHostFlag) sendToAll(data, senderId);
-    } else if(data.type === "log") { log(data.msg); if(isHostFlag) sendToAll(data, senderId); }
+    } else if(data.type === "attack") {
+    const attacker = data.attackerId || senderId;
+
+    if(data.target === myId)
+        takeDamage(data.dmg, data.attackerPos, attacker);
+
+    if(isHostFlag)
+        sendToAll(data, senderId);
+}
+else if(data.type === "log"){
+    log(data.msg);
+}
 }
 
 function flashPlayerRed(id) { 
@@ -277,14 +287,51 @@ function takeDamage(amount, attackerPos = null, attackerId = null) {
 }
 
 function processDeath() {
-    if(isDead) return; isDead = true; myHealth = 0; updateUI();
-    const attackerName = (performance.now() - lastHitTime < 5000 && lastAttackerId && otherPlayers[lastAttackerId]) ? otherPlayers[lastAttackerId].name : null;
-    const msg = attackerName ? `${myName} は ${attackerName} に倒された` : `${myName} は力尽きた`;
-    log(msg); if(isHostFlag) sendToAll({type:"log", msg}); else sendToHost({type:"log", msg});
+    if(isDead) return;
+    isDead = true;
+    myHealth = 0;
+    updateUI();
+
+    const attackerName =
+        (performance.now() - lastHitTime < 5000 &&
+        lastAttackerId &&
+        otherPlayers[lastAttackerId])
+        ? otherPlayers[lastAttackerId].name
+        : null;
+
+    let msg;
+
+    // 落下死（突き落とし）
+    const fallDist = highestYDuringFall - playerY;
+
+    if(attackerName && fallDist > 3){
+        msg = `${myName}は${attackerName}に突き落とされた`;
+    }
+    else if(attackerName){
+        msg = `${myName}は${attackerName}に倒された`;
+    }
+    else{
+        msg = `${myName}は力尽きた`;
+    }
+
+    log(msg);
+
+    if(isHostFlag) sendToAll({type:"log", msg});
+    else sendToHost({type:"log", msg});
+
     setTimeout(() => { 
-        myHealth = 10; velocityY = 0; isDead = false; knockbackVel.set(0,0,0); 
-        camera.position.set(0.5, 2.5, 0.5); playerY = 2.5 + PLAYER_H; 
-        highestYDuringFall = playerY; lastAttackerId = null; updateUI(); 
+        myHealth = 10;
+        velocityY = 0;
+        isDead = false;
+        knockbackVel.set(0,0,0);
+
+        camera.position.set(0.5, 2.5, 0.5);
+        playerY = 2.5 + PLAYER_H;
+
+        highestYDuringFall = playerY;
+        lastAttackerId = null;
+
+        updateUI();
     }, 2000);
 }
 
@@ -507,7 +554,13 @@ document.addEventListener("mousedown", e => {
         if(hits.length > 0) {
             let tId = null; let obj = hits[0].object;
             while(obj) { if(obj.userData.peerId) { tId = obj.userData.peerId; break; } obj = obj.parent; }
-            if(tId) { const atk = {type:"attack", target:tId, dmg:1, attackerPos:camera.position}; if(isHostFlag) handleData(atk, myId); else sendToHost(atk); }
+            if(tId) { const atk = {
+    type:"attack",
+    target:tId,
+    dmg:1,
+    attackerPos:camera.position,
+    attackerId: myId
+}; if(isHostFlag) handleData(atk, myId); else sendToHost(atk); }
         }
     }
     if(e.button === 2) placeBlock();
